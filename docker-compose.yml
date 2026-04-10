@@ -113,8 +113,12 @@ services:
     depends_on:
       registry:
         condition: service_healthy
+    # Note: this container uses the registry:2 image, which treats any
+    # environment variable prefixed with REGISTRY_ as a config override.
+    # Avoid that prefix for script inputs or the registry binary will
+    # log "Ignoring unrecognized environment variable ..." on startup.
     environment:
-      - REGISTRY_URL=http://registry:5000
+      - API_URL=http://registry:5000
       - KEEP_LAST=${KEEP_LAST:-10}
       - INTERVAL_SECONDS=${RETENTION_INTERVAL_SECONDS:-86400}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
