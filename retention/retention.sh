@@ -90,4 +90,35 @@ registry garbage-collect /etc/docker/registry/config.yml --delete-untagged 2>&1 
   | sed 's/^/[retention-gc] /' \
   || log "gc exited non-zero (continuing)"
 
+# --- prune empty repo directories -------------------------------------------
+# Docker Registry v2 has no API to delete a repo — the catalog reads from
+# the filesystem, so a repo with zero tags still appears in /v2/_catalog
+# as an empty listing. Walk the filesystem and remove any repo whose
+# _manifests/tags directory is empty, then clean up now-empty parent
+# directories (for nested repos like `team/project/app`).
+REPO_BASE=/var/lib/registry/docker/registry/v2/repositories
+
+if [ -d "$REPO_BASE" ]; then
+  log "scanning for empty repositories"
+
+  # find every */_manifests/tags directory (one per repo, always at the leaf)
+  find "$REPO_BASE" -type d -path '*/_manifests/tags' 2>/dev/null | while IFS= read -r tags_dir; do
+    # empty if `ls -A` returns nothing
+    if [ -z "$(ls -A "$tags_dir" 2>/dev/null)" ]; then
+      repo_dir=${tags_dir%/_manifests/tags}
+      repo_name=${repo_dir#"$REPO_BASE"/}
+      log "  empty repo: $repo_name — removing $repo_dir"
+      rm -rf "$repo_dir"
+
+      # walk up and prune any parent directories that became empty
+      parent=$(dirname "$repo_dir")
+      while [ "$parent" != "$REPO_BASE" ] && [ -d "$parent" ] \
+            && [ -z "$(ls -A "$parent" 2>/dev/null)" ]; do
+        rmdir "$parent" 2>/dev/null || break
+        parent=$(dirname "$parent")
+      done
+    fi
+  done
+fi
+
 log "cycle complete"
