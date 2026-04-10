@@ -1,0 +1,145 @@
+services:
+  # One-shot: bcrypt-hash ADMIN_PASSWORD into /auth/htpasswd on first boot.
+  # Idempotent — noop if the file already exists in the volume.
+  htpasswd-init:
+    image: httpd:2.4-alpine
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -s /auth/htpasswd ]; then
+          echo "[init] creating htpasswd for user ${ADMIN_USERNAME:-admin}"
+          htpasswd -Bbc /auth/htpasswd "${ADMIN_USERNAME:-admin}" "${ADMIN_PASSWORD}"
+          chmod 0644 /auth/htpasswd
+        else
+          echo "[init] htpasswd already present, skipping"
+        fi
+    environment:
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    volumes:
+      - registry-auth:/auth
+    networks:
+      - dokploy-network
+
+  # Docker's reference container registry. Handles /v2/* (push, pull,
+  # catalog, manifests). Auth: htpasswd from the shared volume.
+  registry:
+    image: registry:2.8.3
+    restart: always
+    depends_on:
+      htpasswd-init:
+        condition: service_completed_successfully
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+      REGISTRY_HTTP_HEADERS_X-Content-Type-Options: "[nosniff]"
+      # Internal-only debug/health server. NOT exposed via Traefik.
+      # The healthcheck below hits /debug/health on this port because
+      # /v2/ requires auth and would 401 on anonymous probes.
+      REGISTRY_HTTP_DEBUG_ADDR: ":5001"
+    volumes:
+      - registry-data:/var/lib/registry
+      - registry-auth:/auth:ro
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:5001/debug/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      # Route /v2/* → registry API (priority 100 — beats the UI catch-all).
+      - "traefik.http.routers.registry-api.rule=Host(`${REGISTRY_DOMAIN}`) && PathPrefix(`/v2`)"
+      - "traefik.http.routers.registry-api.entrypoints=websecure"
+      - "traefik.http.routers.registry-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.registry-api.priority=100"
+      - "traefik.http.routers.registry-api.service=registry-api"
+      - "traefik.http.services.registry-api.loadbalancer.server.port=5000"
+
+  # Web admin panel. Static Vue app served by nginx. Talks to the
+  # registry from the browser using window.location.origin, so all
+  # /v2/* requests go through Traefik to the registry service on the
+  # same domain — no CORS, no extra config.
+  ui:
+    image: joxit/docker-registry-ui:2.5.7
+    restart: always
+    depends_on:
+      registry:
+        condition: service_healthy
+    environment:
+      REGISTRY_TITLE: "Welocalhost CR"
+      SINGLE_REGISTRY: "true"
+      DELETE_IMAGES: "true"
+      SHOW_CONTENT_DIGEST: "true"
+      SHOW_CATALOG_NB_TAGS: "true"
+      CATALOG_ELEMENTS_LIMIT: "1000"
+      TAGLIST_PAGE_SIZE: "100"
+      HISTORY_CUSTOM_LABELS: "maintainer,org.opencontainers.image.source"
+      # Make joxit's internal nginx proxy /v2/* to the registry container
+      # over Docker's internal network. This is what lets the UI work
+      # when it's served on a different domain than the registry — the
+      # browser calls /v2/* on the UI origin, joxit's nginx forwards to
+      # the registry, htpasswd Authorization header flows through. If
+      # the UI and registry share a single domain (compose-label path
+      # routing), Traefik intercepts /v2/* first and this proxy block
+      # is never exercised — so this setting is safe in both layouts.
+      NGINX_PROXY_PASS_URL: "http://registry:5000"
+    networks:
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      # Route everything else → UI (priority 1 — catches all non-/v2 paths).
+      - "traefik.http.routers.registry-ui.rule=Host(`${REGISTRY_DOMAIN}`)"
+      - "traefik.http.routers.registry-ui.entrypoints=websecure"
+      - "traefik.http.routers.registry-ui.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.registry-ui.priority=1"
+      - "traefik.http.routers.registry-ui.service=registry-ui"
+      - "traefik.http.services.registry-ui.loadbalancer.server.port=80"
+
+  # Retention sidecar. Every INTERVAL_SECONDS, deletes old tags via the
+  # registry API (keeping the newest KEEP_LAST per repo), then runs
+  # registry garbage-collect to reclaim disk. Uses the registry:2 image
+  # so it has the `registry` binary and shares the data volume.
+  retention:
+    image: registry:2.8.3
+    restart: always
+    depends_on:
+      registry:
+        condition: service_healthy
+    environment:
+      - REGISTRY_URL=http://registry:5000
+      - KEEP_LAST=${KEEP_LAST:-10}
+      - INTERVAL_SECONDS=${RETENTION_INTERVAL_SECONDS:-86400}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    volumes:
+      - registry-data:/var/lib/registry
+      - ./retention/retention.sh:/retention.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache curl jq coreutils >/dev/null
+        echo "[retention] sidecar ready (keep_last=$${KEEP_LAST}, interval=$${INTERVAL_SECONDS}s)"
+        # Small initial delay so registry finishes warming up
+        sleep 30
+        while true; do
+          /bin/sh /retention.sh || echo "[retention] cycle failed"
+          sleep "$${INTERVAL_SECONDS}"
+        done
+    networks:
+      - dokploy-network
+
+volumes:
+  registry-data:
+  registry-auth:
+
+networks:
+  dokploy-network:
+    external: true
